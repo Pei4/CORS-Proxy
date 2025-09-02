@@ -2,52 +2,59 @@ import express from "express";
 
 const app = express();
 
-// 必填環境變數：
-// N8N_BASE = https://pei4.zeabur.app
-// CORS_ALLOW_ORIGIN = https://pei4.github.io
-const PORT = process.env.PORT || 3000;
-const N8N_BASE = process.env.N8N_BASE;
-const ORIGIN = process.env.CORS_ALLOW_ORIGIN;
-
-if (!N8N_BASE || !ORIGIN) {
-  console.error("請設定環境變數 N8N_BASE 與 CORS_ALLOW_ORIGIN");
-  process.exit(1);
+// Node <18 保險：沒有全域 fetch 時載入 node-fetch
+if (typeof fetch === "undefined") {
+  const { default: nodeFetch } = await import("node-fetch");
+  global.fetch = nodeFetch;
 }
 
-// 以 raw 方式接收所有 content-type，避免被 JSON 解析破壞原始 body
+const PORT = process.env.PORT || 3000;
+const N8N_BASE = process.env.N8N_BASE || "";
+const ORIGIN = process.env.CORS_ALLOW_ORIGIN || "";
+
+// 原始 body
 app.use(express.raw({ type: "*/*", limit: "10mb" }));
 
-// 全域 CORS：任何請求都帶 ACAO；預檢一律在這層回 204
+// 健康檢查（Zeabur 可指到 /health）
+app.get("/health", (req, res) => {
+  res.status(N8N_BASE && ORIGIN ? 200 : 500).json({
+    ok: Boolean(N8N_BASE && ORIGIN),
+    N8N_BASE: N8N_BASE ? "set" : "missing",
+    CORS_ALLOW_ORIGIN: ORIGIN ? "set" : "missing",
+  });
+});
+
+// 也回應根路徑，避免預設健康檢查打 /
+app.get("/", (req, res) => res.status(200).send("OK"));
+
+// 全域 CORS：預檢直接回 204；主請求補 ACAO
 app.use((req, res, next) => {
-  // 預檢
+  const origin = ORIGIN || "*";
   if (req.method === "OPTIONS") {
     res.status(204)
       .set({
-        "Access-Control-Allow-Origin": ORIGIN,
+        "Access-Control-Allow-Origin": origin,
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
         "Access-Control-Allow-Headers": "X-API-Key, Content-Type",
         "Access-Control-Max-Age": "86400",
-        Vary: "Origin"
+        Vary: "Origin",
       })
       .end();
     return;
   }
-  // 主請求回應也統一補 ACAO（其餘標頭由後續處理決定）
-  res.set("Access-Control-Allow-Origin", ORIGIN);
+  res.set("Access-Control-Allow-Origin", origin);
   res.set("Vary", "Origin");
   next();
 });
 
-// 主要轉發：/n8n/* 轉到 N8N_BASE/webhook/*
-// 若 /webhook/ 404，自動 fallback 到 /webhook-test/（方便未 Activate）
+// /n8n/* -> N8N_BASE/webhook/*（404 時 fallback 到 /webhook-test/*）
 app.all("/n8n/*", async (req, res) => {
+  if (!N8N_BASE) return res.status(500).json({ error: "N8N_BASE not set" });
   try {
     const incoming = new URL(req.protocol + "://" + req.get("host") + req.originalUrl);
     const pathOnN8n = incoming.pathname.replace(/^\/n8n\//, "/webhook/");
-    const search = incoming.search; // 保留原本 query
+    const t1 = new URL(pathOnN8n + incoming.search, N8N_BASE);
 
-    // 從 query 取出 key，搬到 header；並從 query 移除 key（後端更乾淨）
-    const t1 = new URL(pathOnN8n + search, N8N_BASE);
     const key = t1.searchParams.get("key") || "";
     t1.searchParams.delete("key");
 
@@ -55,30 +62,37 @@ app.all("/n8n/*", async (req, res) => {
       method: req.method,
       headers: {
         "X-API-Key": key,
-        "Content-Type": req.get("Content-Type") || "application/json"
+        "Content-Type": req.get("Content-Type") || "application/json",
       },
-      body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body
+      body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body,
     };
 
-    // 先嘗試正式 webhook
     let r = await fetch(t1.toString(), init);
-
-    // 未啟用或路徑不在正式 URL 時，fallback 到 webhook-test
     if (r.status === 404) {
       const t2 = new URL(t1.toString().replace("/webhook/", "/webhook-test/"));
       r = await fetch(t2.toString(), init);
     }
 
-    // 轉回應（ACAO 已在全域中介層補上）
     res.status(r.status);
-    // 保留 n8n 原本的回應標頭（除了 ACAO 已補）
     for (const [k, v] of r.headers.entries()) {
       if (k.toLowerCase() !== "content-length") res.setHeader(k, v);
     }
     const buf = Buffer.from(await r.arrayBuffer());
     res.end(buf);
   } catch (err) {
+    console.error("[Proxy Error]", err);
     res
       .status(502)
       .type("application/json")
-      .send(JSON.stringify({ error: "Proxy error", detail: String(err?.message || e
+      .send(JSON.stringify({ error: "Proxy error", detail: String(err?.message || err) }));
+  }
+});
+
+// 其他路徑：友善訊息（仍帶 ACAO，避免誤判成 CORS）
+app.all("*", (req, res) => {
+  res.status(404).json({ error: "Not Found", hint: "Use /n8n/<path>" });
+});
+
+app.listen(PORT, () => {
+  console.log(`CORS proxy listening on :${PORT}`);
+});
