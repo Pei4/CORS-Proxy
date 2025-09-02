@@ -2,22 +2,26 @@ import express from "express";
 
 const app = express();
 
-// 讀環境變數
+// 必填環境變數：
+// N8N_BASE = https://pei4.zeabur.app
+// CORS_ALLOW_ORIGIN = https://pei4.github.io
 const PORT = process.env.PORT || 3000;
-// 你的 n8n 來源，例如 https://pei4.zeabur.app
-const N8N_BASE = process.env.N8N_BASE || "https://pei4.zeabur.app";
-// 允許的前端網域（你的 GitHub Pages）
-const ORIGIN = process.env.CORS_ALLOW_ORIGIN || "https://pei4.github.io";
+const N8N_BASE = process.env.N8N_BASE;
+const ORIGIN = process.env.CORS_ALLOW_ORIGIN;
 
-// 以 raw 方式接收任何 content-type，方便原封轉發
-app.use(express.raw({ type: "*/*", limit: "5mb" }));
+if (!N8N_BASE || !ORIGIN) {
+  console.error("請設定環境變數 N8N_BASE 與 CORS_ALLOW_ORIGIN");
+  process.exit(1);
+}
 
-// 統一處理 /n8n/* 路徑
-app.all("/n8n/*", async (req, res) => {
-  // CORS 預檢
+// 以 raw 方式接收所有 content-type，避免被 JSON 解析破壞原始 body
+app.use(express.raw({ type: "*/*", limit: "10mb" }));
+
+// 全域 CORS：任何請求都帶 ACAO；預檢一律在這層回 204
+app.use((req, res, next) => {
+  // 預檢
   if (req.method === "OPTIONS") {
-    res
-      .status(204)
+    res.status(204)
       .set({
         "Access-Control-Allow-Origin": ORIGIN,
         "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
@@ -28,55 +32,53 @@ app.all("/n8n/*", async (req, res) => {
       .end();
     return;
   }
+  // 主請求回應也統一補 ACAO（其餘標頭由後續處理決定）
+  res.set("Access-Control-Allow-Origin", ORIGIN);
+  res.set("Vary", "Origin");
+  next();
+});
 
+// 主要轉發：/n8n/* 轉到 N8N_BASE/webhook/*
+// 若 /webhook/ 404，自動 fallback 到 /webhook-test/（方便未 Activate）
+app.all("/n8n/*", async (req, res) => {
   try {
-    // 把 /n8n/... 轉給 n8n 的 /webhook/...
-    const incomingUrl = new URL(req.protocol + "://" + req.get("host") + req.originalUrl);
-    const pathOnProxy = incomingUrl.pathname; // /n8n/get-ref-data
-    const pathOnN8n = pathOnProxy.replace(/^\/n8n\//, "/webhook/");
+    const incoming = new URL(req.protocol + "://" + req.get("host") + req.originalUrl);
+    const pathOnN8n = incoming.pathname.replace(/^\/n8n\//, "/webhook/");
+    const search = incoming.search; // 保留原本 query
 
-    const target = new URL(pathOnN8n + incomingUrl.search, N8N_BASE);
+    // 從 query 取出 key，搬到 header；並從 query 移除 key（後端更乾淨）
+    const t1 = new URL(pathOnN8n + search, N8N_BASE);
+    const key = t1.searchParams.get("key") || "";
+    t1.searchParams.delete("key");
 
-    // 從 query 取出 key -> 放到 Header；並從 query 移除 key（可選）
-    const key = target.searchParams.get("key") || "";
-    target.searchParams.delete("key");
-
-    // 準備要轉送給 n8n 的請求
     const init = {
       method: req.method,
       headers: {
-        // 轉送 Content-Type；若沒有，就先給個常見預設
-        "Content-Type": req.get("Content-Type") || "application/json",
-        "X-API-Key": key
+        "X-API-Key": key,
+        "Content-Type": req.get("Content-Type") || "application/json"
       },
-      // GET/HEAD 沒有 body
       body: ["GET", "HEAD"].includes(req.method) ? undefined : req.body
     };
 
-    const r = await fetch(target.toString(), init);
+    // 先嘗試正式 webhook
+    let r = await fetch(t1.toString(), init);
 
-    // 回傳 n8n 的結果給瀏覽器，並補 CORS
-    const respHeaders = new Headers(r.headers);
-    respHeaders.set("Access-Control-Allow-Origin", ORIGIN);
-    respHeaders.set("Vary", "Origin");
+    // 未啟用或路徑不在正式 URL 時，fallback 到 webhook-test
+    if (r.status === 404) {
+      const t2 = new URL(t1.toString().replace("/webhook/", "/webhook-test/"));
+      r = await fetch(t2.toString(), init);
+    }
 
-    // 直接串流回傳
+    // 轉回應（ACAO 已在全域中介層補上）
     res.status(r.status);
-    for (const [k, v] of respHeaders.entries()) res.setHeader(k, v);
-    const arrayBuffer = await r.arrayBuffer();
-    res.end(Buffer.from(arrayBuffer));
+    // 保留 n8n 原本的回應標頭（除了 ACAO 已補）
+    for (const [k, v] of r.headers.entries()) {
+      if (k.toLowerCase() !== "content-length") res.setHeader(k, v);
+    }
+    const buf = Buffer.from(await r.arrayBuffer());
+    res.end(buf);
   } catch (err) {
     res
       .status(502)
-      .set({
-        "Access-Control-Allow-Origin": ORIGIN,
-        Vary: "Origin",
-        "Content-Type": "application/json"
-      })
-      .send(JSON.stringify({ error: "Proxy error", detail: String(err?.message || err) }));
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`CORS proxy listening on :${PORT}`);
-});
+      .type("application/json")
+      .send(JSON.stringify({ error: "Proxy error", detail: String(err?.message || e
